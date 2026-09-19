@@ -1,185 +1,225 @@
-"""The agent: Gemini decides which analytics tool(s) to call and how to phrase the
-answer. It NEVER computes numbers itself -- every figure it states comes back from a
-tool call in bi_agent/analytics.py, which does the maths in pandas.
+"""
+The agent: Groq decides which analytics tool(s) to call and how to phrase
+the answer. It NEVER computes numbers itself.
 """
 
 from __future__ import annotations
 
-import time
 import json
 from typing import Any, Dict, List
 
-from google import genai
-from google.genai import types
+from groq import Groq
 
 from . import analytics
 
 
-SYSTEM_PROMPT = """You are a business-intelligence analyst for Skylark Drones, a founder-facing
-chat assistant over live monday.com data (a Deals/pipeline board and a Work Orders board).
+SYSTEM_PROMPT = """You are a business-intelligence analyst for Skylark Drones,
+a founder-facing chat assistant over live monday.com data.
 
 Rules:
-- Always answer using the tool results you receive. Never invent or estimate a number yourself.
-- Every tool result includes a "caveats" list describing data-quality issues (missing values,
-  status/stage mismatches, stale dates, mixed units, no shared ID between boards, etc).
-  Always weave the caveats that are relevant to the question into your answer in plain
-  language -- don't just append a generic disclaimer.
-- If a question is ambiguous (e.g. which sector, which time period, "this quarter" when most
-  dates are stale, whether to include outlier deals), ask ONE short clarifying question
-  before calling a tool, unless a reasonable default clearly works -- in that case, state
-  the default you're using and proceed.
-- Keep answers concise and founder-friendly: lead with the number, then the one or two caveats
-  that matter, then offer to go deeper.
+- Always answer using the tool results you receive.
+- Never invent or estimate numbers yourself.
+- Every tool result includes a caveats list.
+- Explain relevant caveats in plain language.
+- If a question is ambiguous, ask one short clarifying question.
+- Keep answers concise and founder-friendly.
 """
 
 
-_DECLARATIONS = [
-    types.FunctionDeclaration(
-        name="pipeline_summary",
-        description="Open-deal pipeline value overall and by sector, with/without outliers.",
-        parameters={
-            "type": "OBJECT",
-            "properties": {
-                "sector": {
-                    "type": "STRING",
-                    "description": "Optional sector filter, e.g. 'Mining'.",
-                }
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "pipeline_summary",
+            "description": "Open-deal pipeline value overall and by sector, with and without outliers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sector": {
+                        "type": "string",
+                        "description": "Optional sector filter, such as Mining.",
+                    }
+                },
+                "required": [],
             },
         },
-    ),
-    types.FunctionDeclaration(
-        name="revenue_summary",
-        description="Realised revenue from Won deals, with/without outliers, and value coverage.",
-        parameters={
-            "type": "OBJECT",
-            "properties": {},
-        },
-    ),
-    types.FunctionDeclaration(
-        name="sector_breakdown",
-        description="Deal count/value and Work Order count by sector across both boards (approximate join).",
-        parameters={
-            "type": "OBJECT",
-            "properties": {},
-        },
-    ),
-    types.FunctionDeclaration(
-        name="billing_status_summary",
-        description="Work Order billing state: amount to be billed, amount receivable, by invoice/WO status.",
-        parameters={
-            "type": "OBJECT",
-            "properties": {},
-        },
-    ),
-    types.FunctionDeclaration(
-        name="quantity_summary",
-        description="Total surveyed quantity by unit (Hectares, Acres, Km, ...), optionally filtered by type of work.",
-        parameters={
-            "type": "OBJECT",
-            "properties": {
-                "type_of_work": {
-                    "type": "STRING",
-                    "description": "Optional substring filter, e.g. 'LiDAR'.",
-                }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "revenue_summary",
+            "description": "Realised revenue from Won deals, with and without outliers.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
             },
         },
-    ),
-    types.FunctionDeclaration(
-        name="data_quality_overview",
-        description="All data-quality caveats found during cleaning, for direct 'how reliable is this data' questions.",
-        parameters={
-            "type": "OBJECT",
-            "properties": {},
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sector_breakdown",
+            "description": "Deal count/value and Work Order count by sector.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
         },
-    ),
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "billing_status_summary",
+            "description": "Work Order billing state and amounts receivable.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "quantity_summary",
+            "description": "Total surveyed quantity by unit, optionally filtered by type of work.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "type_of_work": {
+                        "type": "string",
+                        "description": "Optional work type filter, such as LiDAR.",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "data_quality_overview",
+            "description": "Show data-quality caveats found during cleaning.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
 ]
 
 
-_TOOLS = types.Tool(function_declarations=_DECLARATIONS)
-
-
 class Agent:
-    def __init__(self, api_key: str, model: str = "gemini-3.6-flash"):
-        self._client = genai.Client(api_key=api_key)
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "openai/gpt-oss-20b",
+    ):
+        self._client = Groq(api_key=api_key)
         self._model = model
 
     def answer(self, history: List[Dict[str, str]]) -> str:
-        """history: list of {"role": "user"|"model", "content": str}.
-        Returns the reply text.
-        """
+        """Return an answer using Groq and the analytics tools."""
 
-        contents = [
-            types.Content(
-                role=h["role"],
-                parts=[types.Part(text=h["content"])],
-            )
-            for h in history
+        messages = [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT,
+            }
         ]
 
+        for item in history:
+            role = item["role"]
+
+            if role == "model":
+                role = "assistant"
+
+            messages.append(
+                {
+                    "role": role,
+                    "content": item["content"],
+                }
+            )
+
         for _ in range(4):
-            max_retries = 3
-            resp = None
+            response = self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+            )
 
-            for attempt in range(max_retries):
+            message = response.choices[0].message
+
+            assistant_message = {
+                "role": "assistant",
+                "content": message.content or "",
+            }
+
+            if message.tool_calls:
+                assistant_message["tool_calls"] = [
+                    {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.function.name,
+                            "arguments": tool_call.function.arguments,
+                        },
+                    }
+                    for tool_call in message.tool_calls
+                ]
+
+            messages.append(assistant_message)
+
+            if not message.tool_calls:
+                return message.content or (
+                    "I didn't get a response. Please try rephrasing."
+                )
+
+            for tool_call in message.tool_calls:
+                function_name = tool_call.function.name
+
                 try:
-                    resp = self._client.models.generate_content(
-                        model=self._model,
-                        contents=contents,
-                        config=types.GenerateContentConfig(
-                            system_instruction=SYSTEM_PROMPT,
-                            tools=[_TOOLS],
+                    arguments = json.loads(
+                        tool_call.function.arguments or "{}"
+                    )
+                except json.JSONDecodeError:
+                    arguments = {}
+
+                function = analytics.TOOLS.get(function_name)
+
+                if function:
+                    # Remove invalid empty argument names
+                    if isinstance(arguments, dict):
+                        arguments = {
+                            key: value
+                            for key, value in arguments.items()
+                            if isinstance(key, str) and key.strip()
+                        }
+
+                    # Call the analytics function
+                    result: Dict[str, Any] = function(**arguments)
+
+                else:
+                    result = {
+                        "error": f"Unknown tool: {function_name}"
+                    }
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": json.dumps(
+                            result,
+                            default=str,
                         ),
-                    )
-                    break
-
-                except Exception as e:
-                    if "503" in str(e) and attempt < max_retries - 1:
-                        time.sleep(5)
-                    else:
-                        raise
-
-            if resp is None:
-                return "Gemini did not return a response. Please try again."
-
-            candidate = resp.candidates[0]
-
-            fn_calls = [
-                part.function_call
-                for part in candidate.content.parts
-                if part.function_call
-            ]
-
-            if not fn_calls:
-                return resp.text or "I didn't get a response — please try rephrasing."
-
-            contents.append(candidate.content)
-
-            for call in fn_calls:
-                fn = analytics.TOOLS.get(call.name)
-
-                result: Dict[str, Any] = (
-                    fn(**dict(call.args or {}))
-                    if fn
-                    else {"error": f"unknown tool {call.name}"}
+                    }
                 )
 
-                contents.append(
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part(
-                                function_response=types.FunctionResponse(
-                                    name=call.name,
-                                    response={
-                                        "result": json.dumps(
-                                            result,
-                                            default=str,
-                                        )
-                                    },
-                                )
-                            )
-                        ],
-                    )
-                )
-
-        return "I ran into trouble finishing that analysis — please try a narrower question."
+        return (
+            "I ran into trouble finishing that analysis. "
+            "Please try a narrower question."
+        )
