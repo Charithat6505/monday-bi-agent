@@ -39,7 +39,7 @@ def _get(name: str, default: Optional[str] = None) -> Optional[str]:
 class Settings:
     monday_token: Optional[str] = None
     gemini_key: Optional[str] = None
-    gemini_model: str = "gemini-2.5-flash"  # confirmed/updated when we build the agent step
+    gemini_model: str = "gemini-3.6-flash"  # confirmed/updated when we build the agent step
     work_orders_board_id: Optional[str] = None  # optional override; otherwise found by board name
     deals_board_id: Optional[str] = None  # optional override; otherwise found by board name
     monday_api_version: Optional[str] = None  # unset = monday's "current" version
@@ -63,7 +63,7 @@ def load_settings() -> Settings:
     return Settings(
         monday_token=_get("MONDAY_API_TOKEN"),
         gemini_key=_get("GEMINI_API_KEY"),
-        gemini_model=_get("GEMINI_MODEL", "gemini-2.5-flash") or "gemini-2.5-flash",
+        gemini_model=_get("GEMINI_MODEL", "gemini-3.6-flash") or "gemini-3.6-flash",
         work_orders_board_id=_get("WORK_ORDERS_BOARD_ID"),
         deals_board_id=_get("DEALS_BOARD_ID"),
         monday_api_version=_get("MONDAY_API_VERSION"),
